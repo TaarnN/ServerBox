@@ -1,0 +1,28 @@
+{
+  "name": "serverbox",
+  "module": "core/serverbox.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@babel/standalone": "^7.28.0",
+    "@chainsafe/libp2p-gossipsub": "^14.1.1",
+    "@chainsafe/libp2p-noise": "^16.1.4",
+    "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/bootstrap": "^11.0.46",
+    "@libp2p/circuit-relay-v2": "^3.2.23",
+    "@libp2p/identify": "^3.0.38",
+    "@libp2p/webrtc": "^5.2.23",
+    "@libp2p/webrtc-star": "^7.0.0",
+    "@libp2p/websockets": "^9.2.18",
+    "@types/express": "^5.0.3",
+    "@types/simple-peer": "^9.11.8",
+    "express": "^5.1.0",
+    "libp2p": "^2.9.0",
+    "msgpackr": "^1.11.4"
+  }
+}
