@@ -75,12 +75,13 @@ export class ServerBox {
     if (this.initialized || this.options.disableMesh) return;
     this.initialized = true;
 
+    this.mesh = new Libp2pMesh(this.signalingServer);
+    await this.mesh.start();
+
     if (this.signalingServer) {
       this.signalingServer.start();
     }
 
-    this.mesh = new Libp2pMesh(this.signalingServer);
-    await this.mesh.start();
     this.workers = new WorkerManager(this.mesh, this);
   }
 

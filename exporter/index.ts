@@ -44,25 +44,23 @@ export class Exporter {
     this.writeFile(
       outDir,
       "sw.js",
-      `importScripts('serverbox.runtime.js');
+      `import { ROUTER_CONFIG, handleServerBoxRequest } from './serverbox.runtime.js';
 
-      self.addEventListener('fetch', (event) => {
-        const url = new URL(event.request.url);
-        const handler = self.ROUTER_CONFIG.find(r => 
-          r.method === event.request.method && 
-          new RegExp(r.regex).test(url.pathname)
-        );
-
-        // ใช้ handler ถ้ามี ไม่มีก็ fetch ตามปกติ
-        event.respondWith(
-          handler 
-            ? handleServerBoxRequest(event.request, handler)
-            : fetch(event.request)
-        );
-      });`
+  self.addEventListener('fetch', (event) => {
+    const url = new URL(event.request.url);
+    
+    const handler = ROUTER_CONFIG.find(r => 
+      r.method === event.request.method && 
+      new RegExp(r.regex).test(url.pathname)
     );
-    // Copy additional assets
-    // this.copyAssets(outDir);
+
+    event.respondWith(
+      handler 
+        ? handleServerBoxRequest(event.request, handler)
+        : fetch(event.request)
+    );
+  });`
+    );
     return Promise.resolve(outDir);
   }
 
@@ -74,9 +72,15 @@ export class Exporter {
       <script type="module" src="serverbox.runtime.js"></script>
       <script>
         if ("serviceWorker" in navigator) {
-          // ระบุ scope: '/' อย่างชัดเจน
-          navigator.serviceWorker.register("/sw.js", { scope: "/" })
-          .then(reg => console.log("SW registered:", reg.scope))
+          navigator.serviceWorker.register('/sw.js', {
+            type: 'module',
+            scope: '/',
+            updateViaCache: 'none'
+          })
+          .then(reg => {
+            console.log("SW registered:", reg.scope);
+            reg.update();
+          })
           .catch(err => console.error("SW failed:", err));
         }
       </script>
@@ -89,91 +93,68 @@ export class Exporter {
     const signalingPort = (sbx as any).signalingServer?.port || 9090;
 
     return `
-    // ServerBox Client Runtime (ES Module)
+    "use strict";
 
+    // ป้องกันการโหลด reflect-metadata ใน SES environment
+    if (typeof window === 'undefined') {
+      delete globalThis.Reflect;
+    }
+
+    import 'ses';
     import { createLibp2p } from "libp2p";
     import { webSockets } from "@libp2p/websockets";
-    import { webRTCStar } from "@libp2p/webrtc-star";
     import { bootstrap } from "@libp2p/bootstrap";
     import { gossipsub } from "@chainsafe/libp2p-gossipsub";
     import { identify } from "@libp2p/identify";
     import { noise } from "@chainsafe/libp2p-noise";
     import { yamux } from "@chainsafe/libp2p-yamux";
-    import { circuitRelayTransport } from '@libp2p/circuit-relay-v2'
+    import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+    import { webRTC } from "@libp2p/webrtc";
+    import { webRTCStar } from "@libp2p/webrtc-star";
+  
+    // ปรับค่า SES lockdown
+    if (typeof window === 'undefined') {
+      lockdown({
+        errorTaming: 'unsafe',
+        overrideTaming: 'severe',
+        consoleTaming: 'unsafe',
+        unhandledRejectionTrapping: 'report'
+      });
+    }
 
-    async function runProcess(processCode, chunk) {
-      const fn = new Function("data", \`
-        "use strict";
-        return (async () => {
-          \${processCode}
-        })();
-      \`);
-      return await fn({ chunk });
+    export const ROUTER_CONFIG = ${this.serializeRouter(sbx)};
+    export let handleServerBoxRequest;
+
+    if (typeof window === 'undefined') {
+      // Service Worker context
+      if (typeof self !== 'undefined') {
+        handleServerBoxRequest = async function(request, handler) {
+          const c = new Compartment({
+            console: { log: console.log, warn: console.warn, error: console.error },
+            request,
+            handler
+          });
+          return await c.evaluate(\`
+            "use strict";
+            (async () => {
+              try {
+                const response = await handler.handler(request);
+                return new Response(response.body, {
+                  status: response.status,
+                  headers: response.headers
+                });
+              } catch (err) {
+                console.error('Handler error:', err);
+                return new Response(null, { status: 500 });
+              }
+            })()
+          \`);
+        };
+      }
     }
 
     async function splitRuntime(data, strategy, options) {
       switch (strategy) {
-        case "array": {
-          const chunkSize = options?.chunkSize || 100;
-          const chunks = [];
-          for (let i = 0; i < data.length; i += chunkSize) {
-            const chunk = data.slice(i, i + chunkSize);
-            if (options?.process) {
-              chunks.push(await runProcess(options.process, chunk));
-            } else {
-              chunks.push({ chunk });
-            }
-          }
-          return chunks;
-        }
-        case "matrix": {
-          const chunks = [{ chunk: data }];
-          if (options?.process) {
-            return [ await runProcess(options.process, data) ];
-          }
-          return chunks;
-        }
-        case "object": {
-          const entries = Object.entries(data);
-          const chunks = entries.map(([key, value]) => ({ chunk: { [key]: value } }));
-          if (options?.process) {
-            return Promise.all(chunks.map(c => runProcess(options.process, c.chunk)));
-          }
-          return chunks;
-        }
-        case "map": {
-          if (!(data instanceof Map)) throw new Error("Data is not a Map");
-          const entries = Array.from(data.entries());
-          const chunkSize = options?.chunkSize || entries.length;
-          const chunks = [];
-          for (let i = 0; i < entries.length; i += chunkSize) {
-            const chunkMap = new Map(entries.slice(i, i + chunkSize));
-            if (options?.process) {
-              chunks.push(await runProcess(options.process, chunkMap));
-            } else {
-              chunks.push({ chunk: chunkMap });
-            }
-          }
-          return chunks;
-        }
-        case "range": {
-          const start = options?.start ?? data.start;
-          const end = options?.end ?? data.end;
-          const step = options?.step || 1;
-          const span = options?.chunkSize || 100;
-          const chunks = [];
-          for (let i = start; i <= end; i += span) {
-            const currentEnd = Math.min(i + span - 1, end);
-            const arr = [];
-            for (let n = i; n <= currentEnd; n += step) arr.push(n);
-            if (options?.process) {
-              chunks.push(await runProcess(options.process, arr));
-            } else {
-              chunks.push({ chunk: arr });
-            }
-          }
-          return chunks;
-        }
         case "file": {
           const buffer = data instanceof ArrayBuffer
             ? data
@@ -193,13 +174,13 @@ export class Exporter {
         }
         case "custom": {
           if (!options?.splitFn) throw new Error("Missing splitFn for custom strategy");
-          const fn = new Function("data", \`
+          const c = new Compartment({ data });
+          return await c.evaluate(\`
             "use strict";
-            return (async () => {
+            (async () => {
               \${options.splitFn}
-            })();
+            })()
           \`);
-          return await fn(data);
         }
         case "graph": {
           if (!Array.isArray(data.nodes)) throw new Error("Invalid graph format");
@@ -259,13 +240,13 @@ export class Exporter {
           );
         case "custom":
           if (options?.mergeFn) {
-            const fn = new Function("results", \`
+            const c = new Compartment({ results });
+            return await c.evaluate(\`
               "use strict";
-              return (async () => {
+              (async () => {
                 \${options.mergeFn}
-              })();
+              })()
             \`);
-            return await fn(results);
           }
           return results;
         case "graph":
@@ -279,26 +260,34 @@ export class Exporter {
     if (typeof window === 'undefined' && typeof self !== 'undefined') {
       self.ROUTER_CONFIG = ${this.serializeRouter(sbx)};
       
-      let runInSandbox = async function(code, context) {
-  try {
-    const keys = Object.keys(context);
-    const values = keys.map(k => context[k]);
+      const lockdownCode = \`
+        lockdown({
+          errorTaming: 'unsafe',
+          overrideTaming: 'severe',
+          consoleTaming: 'unsafe',
+          unhandledRejectionTrapping: 'report'
+        });
+      \`;
 
-    const fn = new Function(...keys, \`
-      "use strict";
-      return (async () => {
-        \${code}
-      })();
-    \`);
-
-    return await fn(...values);
-  } catch (error) {
-    throw error;
-  }
-};
-
+      let runInSandbox = async function(code6, context) {
+        const c = new Compartment({
+          ...context,
+          console: harden({ log: console.log, warn: console.warn, error: console.error })
+        });
+        return c.evaluate(\`
+          "use strict";
+          (async () => {
+            try {
+              \${code6}
+            } catch (e) {
+              console.error('Sandbox error:', e);
+              throw e;
+            }
+          })();
+        \`);
+      };
       
-      async function handleServerBoxRequest(request, handler) {
+      handleServerBoxRequest = async function (request, handler) {
         try {
           const sbx = {
             mesh: {
@@ -358,18 +347,6 @@ export class Exporter {
           return new Response('Internal Server Error', { status: 500 });
         }
       }
-      
-      self.addEventListener('fetch', (event) => {
-        const url = new URL(event.request.url);
-        const handler = self.ROUTER_CONFIG.find(r => 
-          r.method === event.request.method && 
-          new RegExp(r.regex).test(url.pathname)
-        );
-        
-        if (handler) {
-          event.respondWith(handleServerBoxRequest(event.request, handler));
-        }
-      });
     } else {
       // Browser context
       self.ROUTER_CONFIG = ${this.serializeRouter(sbx)};
@@ -383,7 +360,8 @@ export class Exporter {
             const keys = Object.keys(context);
             const values = keys.map(k => context[k]);
 
-            const fn = new Function(...keys, \\\`
+            const c = new Compartment({ [keys]: values });
+            return await c.evaluate(\\\`
               "use strict";
               return (async () => {
                 \\\${code}
@@ -429,27 +407,35 @@ export class Exporter {
             this.peerCapabilities = new Map();
           }
           async start() {
-            const transports = [webSockets(), circuitRelayTransport()];
+            const transports = [
+              webSockets(),
+              circuitRelayTransport(),
+            ];
 
+            let star;
             if (this.signalingPort) {
-              const { webRTC } = await import('@libp2p/webrtc');
-              transports.push(new webRTC());
+              transports.push(webRTC());
             } else {
-              const star = webRTCStar();
+              star = webRTCStar();
               transports.push(star.transport);
+            }
+
+            const peerDiscoveryList = [
+              bootstrap({ list: [
+                "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa"
+              ]})
+            ];
+
+            if (star) {
+              peerDiscoveryList.push(star.discovery);
             }
 
             this.node = await createLibp2p({
               transports,
               connectionEncrypters: [noise()],
               streamMuxers: [yamux()],
-              peerDiscovery: [
-                bootstrap({ list: [
-                  "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-                  "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa"
-                ]}),
-                ...(this.signalingPort ? [] : [star.discovery]),
-              ],
+              peerDiscovery: peerDiscoveryList,
               services: {
                 identify: identify(),
                 pubsub: gossipsub({ allowPublishToZeroTopicPeers: true, emitSelf: false }),
@@ -599,19 +585,10 @@ export class Exporter {
               },
               send: function(body) {
                 return { status: this.statusCode, body };
-              },
-              json: function(body) {
-                return this.send(JSON.stringify(body));
-              },
-              setHeader: function() { return this; }
+              }
             };
             
-            ${route.handler
-              .toString()
-              .replace("function (req, res)", "function handlerFn(req, res)")
-              .replace("function(req, res)", "function handlerFn(req, res)")}
-            
-            return handlerFn(req, res);
+            return (${route.handler.toString()})(req, res);
           }`,
         };
       })

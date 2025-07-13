@@ -1,7 +1,7 @@
 // File: /runtime/sandbox.ts
 import vm from "vm";
 import "ses"; // ESM style
-lockdown({ errorTaming: "safe" });
+lockdown();
 
 export class Sandbox {
   constructor(
