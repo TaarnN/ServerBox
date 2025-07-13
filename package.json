@@ -2,6 +2,7 @@
   "name": "serverbox",
   "module": "core/serverbox.ts",
   "type": "module",
+  "version": "0.0.2",
   "devDependencies": {
     "@types/bun": "latest"
   },

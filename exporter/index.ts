@@ -3,39 +3,6 @@ import { ServerBox } from "../core/serverbox";
 import * as fs from "fs";
 import * as path from "path";
 
-async function splitRuntime(
-  data: any,
-  strategy: string,
-  options?: any
-): Promise<any[]> {
-  if (strategy === "array") {
-    const chunkSize = options?.chunkSize || 100;
-    const chunks = [];
-    for (let i = 0; i < data.length; i += chunkSize) {
-      chunks.push({ chunk: data.slice(i, i + chunkSize) });
-    }
-    return chunks;
-  }
-  if (strategy === "matrix") {
-    // ทำ logic chunking สำหรับ matrix
-    return [{ chunk: data }];
-  }
-  throw new Error("Unknown split strategy: " + strategy);
-}
-
-function mergeRuntime(results: any[], strategy: string, options?: any): any {
-  if (strategy === "array") {
-    return results.flat();
-  }
-  if (strategy === "matrix") {
-    return results.reduce((acc, r) => acc.concat(r), []);
-  }
-  throw new Error("Unknown merge strategy: " + strategy);
-}
-
-const splitFuncStr = splitRuntime.toString();
-const mergeFuncStr = mergeRuntime.toString();
-
 export class Exporter {
   private static patternToRegex(pattern: string): string {
     if (!pattern.startsWith("/")) pattern = "/" + pattern;
@@ -134,6 +101,180 @@ export class Exporter {
     import { yamux } from "@chainsafe/libp2p-yamux";
     import { circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 
+    async function runProcess(processCode, chunk) {
+      const fn = new Function("data", \`
+        "use strict";
+        return (async () => {
+          \${processCode}
+        })();
+      \`);
+      return await fn({ chunk });
+    }
+
+    async function splitRuntime(data, strategy, options) {
+      switch (strategy) {
+        case "array": {
+          const chunkSize = options?.chunkSize || 100;
+          const chunks = [];
+          for (let i = 0; i < data.length; i += chunkSize) {
+            const chunk = data.slice(i, i + chunkSize);
+            if (options?.process) {
+              chunks.push(await runProcess(options.process, chunk));
+            } else {
+              chunks.push({ chunk });
+            }
+          }
+          return chunks;
+        }
+        case "matrix": {
+          const chunks = [{ chunk: data }];
+          if (options?.process) {
+            return [ await runProcess(options.process, data) ];
+          }
+          return chunks;
+        }
+        case "object": {
+          const entries = Object.entries(data);
+          const chunks = entries.map(([key, value]) => ({ chunk: { [key]: value } }));
+          if (options?.process) {
+            return Promise.all(chunks.map(c => runProcess(options.process, c.chunk)));
+          }
+          return chunks;
+        }
+        case "map": {
+          if (!(data instanceof Map)) throw new Error("Data is not a Map");
+          const entries = Array.from(data.entries());
+          const chunkSize = options?.chunkSize || entries.length;
+          const chunks = [];
+          for (let i = 0; i < entries.length; i += chunkSize) {
+            const chunkMap = new Map(entries.slice(i, i + chunkSize));
+            if (options?.process) {
+              chunks.push(await runProcess(options.process, chunkMap));
+            } else {
+              chunks.push({ chunk: chunkMap });
+            }
+          }
+          return chunks;
+        }
+        case "range": {
+          const start = options?.start ?? data.start;
+          const end = options?.end ?? data.end;
+          const step = options?.step || 1;
+          const span = options?.chunkSize || 100;
+          const chunks = [];
+          for (let i = start; i <= end; i += span) {
+            const currentEnd = Math.min(i + span - 1, end);
+            const arr = [];
+            for (let n = i; n <= currentEnd; n += step) arr.push(n);
+            if (options?.process) {
+              chunks.push(await runProcess(options.process, arr));
+            } else {
+              chunks.push({ chunk: arr });
+            }
+          }
+          return chunks;
+        }
+        case "file": {
+          const buffer = data instanceof ArrayBuffer
+            ? data
+            : await data.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          const chunkSize = options?.chunkSize || 1024 * 1024;
+          const chunks = [];
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            const slice = bytes.slice(i, i + chunkSize);
+            if (options?.process) {
+              chunks.push(await runProcess(options.process, slice));
+            } else {
+              chunks.push({ chunk: slice });
+            }
+          }
+          return chunks;
+        }
+        case "custom": {
+          if (!options?.splitFn) throw new Error("Missing splitFn for custom strategy");
+          const fn = new Function("data", \`
+            "use strict";
+            return (async () => {
+              \${options.splitFn}
+            })();
+          \`);
+          return await fn(data);
+        }
+        case "graph": {
+          if (!Array.isArray(data.nodes)) throw new Error("Invalid graph format");
+          const chunks = data.nodes.map(node => ({ chunk: node }));
+          if (options?.process) {
+            return Promise.all(chunks.map(c => runProcess(options.process, c.chunk)));
+          }
+          return chunks;
+        }
+        default:
+          throw new Error("Unknown split strategy: " + strategy);
+      }
+    }
+
+    function concatUint8Arrays(arrays) {
+      const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const arr of arrays) {
+        result.set(arr, offset);
+        offset += arr.length;
+      }
+      return result;
+    }
+
+    async function mergeRuntime(results, strategy, options) {
+      switch (strategy) {
+        case "array":
+          return results.flat();
+        case "matrix":
+          return results.reduce((acc, r) => acc.concat(r), []);
+        case "object":
+          return results.reduce((acc, r) => {
+            const obj = r && r.chunk ? r.chunk : r;
+            return Object.assign(acc, obj);
+          }, {});
+        case "map": {
+          const merged = new Map();
+          for (const r of results) {
+            const m = r instanceof Map
+              ? r
+              : r.chunk instanceof Map
+                ? r.chunk
+                : null;
+            if (!m) throw new Error("Cannot merge non-Map chunk");
+            for (const [k, v] of m.entries()) {
+              merged.set(k, v);
+            }
+          }
+          return merged;
+        }
+        case "range":
+          return results.flat();
+        case "file":
+          return concatUint8Arrays(
+            results.map(r => (r.chunk instanceof Uint8Array ? r.chunk : r))
+          );
+        case "custom":
+          if (options?.mergeFn) {
+            const fn = new Function("results", \`
+              "use strict";
+              return (async () => {
+                \${options.mergeFn}
+              })();
+            \`);
+            return await fn(results);
+          }
+          return results;
+        case "graph":
+          return results.map(r => (r && r.chunk !== undefined ? r.chunk : r));
+        default:
+          throw new Error("Unknown merge strategy: " + strategy);
+      }
+    }
+
     // Service Worker context
     if (typeof window === 'undefined' && typeof self !== 'undefined') {
       self.ROUTER_CONFIG = ${this.serializeRouter(sbx)};
@@ -161,10 +302,12 @@ export class Exporter {
         try {
           const sbx = {
             mesh: {
-              getPeerId: () => "local",
-              split: ${splitFuncStr},
-              merge: ${mergeFuncStr}
-            }
+              getPeerId: () => "local"
+            },
+            split: async (data, strategy, options) => 
+              await splitRuntime(data, strategy, options),
+            merge: (results, strategy, options) => 
+              mergeRuntime(results, strategy, options)
           };
           const url = new URL(request.url);
           let body = {};
@@ -180,8 +323,17 @@ export class Exporter {
             method: request.method,
             path: url.pathname,
             headers: Object.fromEntries(request.headers.entries()),
-            body
+            body,
+            params: {} // Initialize empty params object
           };
+
+          // Extract path parameters
+          const match = url.pathname.match(new RegExp(handler.regex));
+          if (match && handler.paramNames) {
+            handler.paramNames.forEach((name, index) => {
+              req.params[name] = match[index + 1];
+            });
+          }
           
           const result = await runInSandbox(
             \`return (\${handler.fn})(req, sbx);\`,
@@ -373,20 +525,39 @@ export class Exporter {
           }
 
           handleServerBoxRequest = async function(request, handler) {
-          
+            const url = new URL(request.url);
             const req = {
               method: request.method,
-              path: request.url,
+              path: url.pathname,
               headers: Object.fromEntries(request.headers.entries()),
               body: await request.json(),
+              params: {}
             };
+
+            const match = url.pathname.match(new RegExp(handler.regex));
+            if (match && handler.paramNames) {
+              handler.paramNames.forEach((name, index) => {
+                req.params[name] = match[index + 1];
+              });
+            }
+
+            const sbx = {
+              mesh: {
+                getPeerId: () => "local"
+              },
+              split: async (data, strategy, options) => 
+                await splitRuntime(data, strategy, options),
+              merge: (results, strategy, options) => 
+                mergeRuntime(results, strategy, options)
+            };
+
             const res = {
               statusCode: 200, headers: {},
               status(c) { this.statusCode = c; return this; },
               setHeader(n, v) { this.headers[n] = v; return this; },
               send(body) { return new Response(body, { status: this.statusCode, headers: this.headers }); }
             };
-            const result = await workers.execute(handler.fn, req);
+            const result = await workers.execute(handler.fn, req, sbx);
             return res.send(result);
           };
 
@@ -418,6 +589,7 @@ export class Exporter {
           method: route.method,
           path: route.pattern,
           regex: this.patternToRegex(route.pattern),
+          paramNames: this.extractParamNames(route.pattern),
           fn: `(req, sbx) => {
             const res = {
               statusCode: 200,
@@ -445,6 +617,19 @@ export class Exporter {
       })
       .filter(Boolean);
     return JSON.stringify(routes, null, 2);
+  }
+
+  private static extractParamNames(pattern: string): string[] {
+    const names: string[] = [];
+    const segments = pattern.split("/").filter(Boolean);
+
+    segments.forEach((seg) => {
+      if (seg.startsWith(":")) {
+        names.push(seg.slice(1).replace(/\?$/, ""));
+      }
+    });
+
+    return names;
   }
 
   private static generateWorkerJs() {
